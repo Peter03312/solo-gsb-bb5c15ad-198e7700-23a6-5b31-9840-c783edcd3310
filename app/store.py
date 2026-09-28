@@ -124,7 +124,10 @@ def get_merge_patch(merge_id: str) -> dict:
     )
     if row is None:
         raise MergeNotFound(merge_id)
-    if row["status"] != STATUS_RESOLVED or row["result"] is None:
+    # Status is the sole availability marker: a resolved merge always has a
+    # result persisted as JSON text (``"null"`` when the root value itself is
+    # JSON null); SQL NULL only ever marks a still-pending merge.
+    if row["status"] != STATUS_RESOLVED:
         raise MergeNotResolved(merge_id)
     base = json.loads(row["base_doc"])
     result = json.loads(row["result"])
@@ -165,7 +168,10 @@ def export_evidence(merge_id: str) -> dict:
     )
     if row is None:
         raise MergeNotFound(merge_id)
-    if row["status"] != STATUS_RESOLVED or row["result"] is None:
+    # Status alone decides availability: a resolved merge keeps its result
+    # as JSON text even when the root value is JSON null (``"null"``); only
+    # a pending merge carries SQL NULL.
+    if row["status"] != STATUS_RESOLVED:
         raise MergeNotResolved(merge_id)
     return evidence.build_package(
         merge_id,
@@ -206,9 +212,8 @@ def create_merge(
     status = STATUS_RESOLVED if not conflicts else STATUS_PENDING
     # No conflicts: the result is final and immutable from the start, so it
     # must pass the result schema (gate 2) before anything is persisted.
-    if not conflicts and result_schema is not None:
+    if status == STATUS_RESOLVED and result_schema is not None:
         validate_result(result_schema, document)
-    result = document if not conflicts else None
 
     merge_id = uuid.uuid4().hex
     try:
@@ -240,7 +245,11 @@ def create_merge(
                 # replays audit events from this snapshot instead of
                 # reverse-editing the current document.
                 json.dumps(document),
-                json.dumps(result) if result is not None else None,
+                # The result is stored strictly by status: a resolved merge
+                # always persists JSON text (the root value JSON null is
+                # written as the text "null", never SQL NULL), while a
+                # pending merge keeps SQL NULL to mark "no result yet".
+                json.dumps(document) if status == STATUS_RESOLVED else None,
                 json.dumps(result_schema) if result_schema is not None else None,
                 now,
                 now,
@@ -606,7 +615,7 @@ def reuse_resolutions(
             raise SourceMergeInvalid(
                 f"source merge {source_merge_id!r} does not exist"
             )
-        if source_row["status"] != STATUS_RESOLVED or source_row["result"] is None:
+        if source_row["status"] != STATUS_RESOLVED:
             raise SourceMergeInvalid(
                 f"source merge {source_merge_id!r} is not resolved yet"
             )

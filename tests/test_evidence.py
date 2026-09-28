@@ -178,6 +178,41 @@ def test_export_conflict_free_merge_has_empty_audit(client):
     assert verify(client, package).json()["valid"] is True
 
 
+def test_export_root_null_result_package(client):
+    # A conflict-free merge whose final document is the JSON root value
+    # null must export like any other resolved merge (not 409) and verify:
+    # the root-replace patch replays base -> null exactly.
+    merge = make_merge(client, {"a": 1}, None, None)
+    assert merge["status"] == "resolved"
+    assert merge["result"] is None
+    mid = merge["merge_id"]
+
+    resp = client.get(f"/merges/{mid}/evidence")
+    assert resp.status_code == 200, resp.text
+    package = resp.json()
+    payload = package["payload"]
+    assert payload["base"] == {"a": 1}
+    assert payload["result"] is None
+    assert payload["patch"] == [{"op": "replace", "path": "", "value": None}]
+    assert payload["audit"] == []
+    assert package["signature"] == sign(payload)
+    assert verify(client, package).json()["valid"] is True
+
+
+def test_export_root_null_after_adjudication(client):
+    # Same outcome via adjudicating a root conflict to an explicit null.
+    merge = make_merge(client, 1, None, 2)
+    assert merge["status"] == "pending"
+    mid = merge["merge_id"]
+    resolve(client, mid, 1, [{"pointer": "", "value": None}])
+
+    package = export(client, mid)
+    payload = package["payload"]
+    assert payload["result"] is None
+    assert payload["patch"] == [{"op": "replace", "path": "", "value": None}]
+    assert verify(client, package).json()["valid"] is True
+
+
 def test_export_includes_complete_audit_history(client):
     merge = three_conflict_merge(client)
     mid = merge["merge_id"]

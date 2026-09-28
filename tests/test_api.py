@@ -322,6 +322,99 @@ def test_no_conflict_merge_is_immediately_resolved(client):
     assert body["result"] == {"a": 2}
 
 
+def test_conflict_free_root_null_merge_is_resolved_with_result(client):
+    # The merged document is the JSON root value null: a legitimate final
+    # result that must not be confused with "no result yet" (SQL NULL).
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1}, "left": None, "right": None},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["status"] == "resolved"
+    assert body["conflict_count"] == 0
+    assert body["result"] is None  # JSON null, decoded to Python None
+    mid = body["merge_id"]
+
+    # Stored as the JSON text "null", distinct from a pending SQL NULL.
+    from app import db
+
+    stored = db.query_one("SELECT result FROM merges WHERE id = ?", (mid,))["result"]
+    assert stored == "null"
+
+    # Status query still reports the resolved null.
+    fetched = client.get(f"/merges/{mid}").json()
+    assert fetched["status"] == "resolved"
+    assert fetched["result"] is None
+
+
+def test_root_null_merge_patch_is_root_replace(client):
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1}, "left": None, "right": None},
+    )
+    mid = resp.json()["merge_id"]
+
+    resp = client.get(f"/merges/{mid}/patch")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "resolved"
+    assert body["patch"] == [{"op": "replace", "path": "", "value": None}]
+
+    # The root replace applies back to the base and rebuilds the null result.
+    from tests.patch_apply import apply_patch
+
+    assert apply_patch({"a": 1}, body["patch"]) is None
+
+    # The result digest is the digest of canonical JSON "null".
+    from app.patch import sha256_hex
+
+    assert body["result_sha256"] == sha256_hex(None)
+
+
+def test_conflict_resolved_to_root_null_serves_patch(client):
+    # A root conflict adjudicated to an explicit null reaches the same
+    # resolved-with-null state through the adjudication commit path.
+    resp = client.post("/merges", json={"base": 1, "left": None, "right": 2})
+    assert resp.status_code == 201
+    mid = resp.json()["merge_id"]
+    assert resp.json()["status"] == "pending"
+
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": [{"pointer": "", "value": None}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "resolved"
+    assert resp.json()["result"] is None
+
+    patch = client.get(f"/merges/{mid}/patch")
+    assert patch.status_code == 200, patch.text
+    assert patch.json()["patch"] == [
+        {"op": "replace", "path": "", "value": None}
+    ]
+
+
+def test_idempotent_root_null_merge_replays_resolved_record(client):
+    payload = {"base": {"a": 1}, "left": None, "right": None,
+               "idempotency_key": "root-null-order"}
+    first = client.post("/merges", json=payload)
+    assert first.status_code == 201
+    assert first.json()["status"] == "resolved"
+    assert first.json()["result"] is None
+
+    replay = client.post("/merges", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["merge_id"] == first.json()["merge_id"]
+    assert replay.json()["status"] == "resolved"
+    assert replay.json()["result"] is None
+
+    # The replayed order's patch/evidence reads work normally.
+    mid = first.json()["merge_id"]
+    assert client.get(f"/merges/{mid}/patch").status_code == 200
+    assert client.get(f"/merges/{mid}/evidence").status_code == 200
+
+
 def test_unknown_merge_404(client):
     assert client.get("/merges/does-not-exist").status_code == 404
     assert client.get("/merges/does-not-exist/patch").status_code == 404

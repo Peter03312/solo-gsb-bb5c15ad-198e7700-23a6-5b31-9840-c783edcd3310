@@ -155,6 +155,31 @@ def _audit_table_accepts_all_methods(conn: sqlite3.Connection) -> bool:
     return all(f"'{method}'" in constraint for method in METHODS)
 
 
+def _repair_resolved_null_results(conn: sqlite3.Connection) -> None:
+    """Repair legacy rows left in an impossible state by an older build.
+
+    A resolved merge order always carries a final result, persisted as JSON
+    text: the root value JSON null is stored as the text ``"null"`` and only
+    a still-pending order keeps SQL NULL. Earlier builds wrote SQL NULL even
+    for a conflict-free merge whose final document was the JSON root value
+    null (``status='resolved'`` but ``result IS NULL``), which then made the
+    patch/evidence reads misreport the order as pending (409).
+
+    Recover the missing result from the saved working ``document`` — the
+    immutable final document for a resolved order — without touching pending
+    rows, whose SQL NULL genuinely means "no result produced yet". The
+    update matches no rows once every row is repaired, so it is safe to run
+    on every startup.
+    """
+    conn.execute(
+        """
+        UPDATE merges
+        SET result = document
+        WHERE status = 'resolved' AND result IS NULL AND document IS NOT NULL
+        """
+    )
+
+
 def init_schema() -> None:
     with _lock:
         conn = connect()
@@ -163,6 +188,7 @@ def init_schema() -> None:
         for statement, column in _MIGRATIONS:
             if column not in existing:
                 conn.execute(statement)
+        _repair_resolved_null_results(conn)
         if not _audit_table_accepts_all_methods(conn):
             # SQLite cannot ALTER a CHECK constraint: rebuild the table,
             # copying every stored event verbatim (hashes preserved).

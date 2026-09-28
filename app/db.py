@@ -200,6 +200,20 @@ def init_schema() -> None:
                 """
             )
             conn.execute("DROP TABLE merge_audit_events_old")
+        # Repair rows written before resolved root-level JSON null results
+        # were stored as the JSON text 'null': a conflict-free merge whose
+        # result was exactly None used to persist SQL NULL despite being
+        # 'resolved'. For those rows the working document never changes
+        # after creation (resolved from the start, no open conflicts), so
+        # the saved document is the lost result. Pending rows genuinely
+        # have no result and are deliberately left untouched.
+        conn.execute(
+            """
+            UPDATE merges
+            SET result = document
+            WHERE status = 'resolved' AND result IS NULL
+            """
+        )
         conn.commit()
 
 

@@ -861,3 +861,142 @@ def test_identical_bool_change_still_auto_merges(client):
     assert analysis["would_conflict"] is False
     assert analysis["counts"]["conflict"] == 0
     assert analysis["changes"][0]["type"] == "same_change"
+
+
+# ---------------------------------------------------------------------------
+# Root-level JSON null result: resolved status must not be confused with
+# SQL NULL storage ("no result yet" is reserved for pending merges).
+# ---------------------------------------------------------------------------
+
+
+def test_conflict_free_root_null_merge_is_resolved_and_served(client):
+    # Both sides change the whole document to null identically: no conflict,
+    # the merge is resolved immediately with result JSON null.
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1}, "left": None, "right": None},
+    )
+    assert resp.status_code == 201, resp.text
+    merge = resp.json()
+    assert merge["status"] == "resolved"
+    assert merge["conflict_count"] == 0
+    assert merge["result"] is None
+    merge_id = merge["merge_id"]
+
+    # The stored result is the JSON text 'null', never SQL NULL.
+    from app import db
+
+    row = db.query_one("SELECT result FROM merges WHERE id = ?", (merge_id,))
+    assert row["result"] == "null"
+
+    # GET by id returns the resolved record with a JSON-null result.
+    fetched = client.get(f"/merges/{merge_id}").json()
+    assert fetched["status"] == "resolved"
+    assert fetched["result"] is None
+
+    # Patch endpoint is available and emits a root replace with value null.
+    patch = client.get(f"/merges/{merge_id}/patch")
+    assert patch.status_code == 200, patch.text
+    body = patch.json()
+    assert body["status"] == "resolved"
+    assert body["patch"] == [{"op": "replace", "path": "", "value": None}]
+    # SHA-256 is over the canonical serialization of JSON null.
+    import hashlib
+
+    assert body["result_sha256"] == hashlib.sha256(b"null").hexdigest()
+
+    # Evidence endpoint is available and its package verifies end to end.
+    ev = client.get(f"/merges/{merge_id}/evidence")
+    assert ev.status_code == 200, ev.text
+    package = ev.json()
+    assert package["payload"]["result"] is None
+    assert package["payload"]["patch"] == [
+        {"op": "replace", "path": "", "value": None}
+    ]
+    verdict = client.post("/evidence/verify", json=package)
+    assert verdict.status_code == 200
+    assert verdict.json()["valid"] is True
+
+
+def test_conflict_free_root_null_when_all_three_sides_are_null(client):
+    # base/left/right all null: resolved, empty base-to-result patch, and
+    # the empty-patch evidence package still verifies.
+    resp = client.post("/merges", json={"base": None, "left": None, "right": None})
+    assert resp.status_code == 201, resp.text
+    merge_id = resp.json()["merge_id"]
+
+    patch = client.get(f"/merges/{merge_id}/patch").json()
+    assert patch["patch"] == []
+
+    package = client.get(f"/merges/{merge_id}/evidence").json()
+    assert package["payload"]["result"] is None
+    verdict = client.post("/evidence/verify", json=package)
+    assert verdict.json()["valid"] is True
+
+
+def test_idempotent_root_null_merge_replays_resolved_record(client):
+    payload = {"base": {"a": 1}, "left": None, "right": None}
+    first = client.post(
+        "/merges", json={**payload, "idempotency_key": "root-null-key"}
+    )
+    assert first.status_code == 201
+    first_body = first.json()
+    assert first_body["status"] == "resolved"
+    assert first_body["result"] is None
+
+    # Repeated idempotency key replays the original resolved record (200),
+    # not a fresh pending one.
+    second = client.post(
+        "/merges", json={**payload, "idempotency_key": "root-null-key"}
+    )
+    assert second.status_code == 200
+    assert second.json()["merge_id"] == first_body["merge_id"]
+    assert second.json()["status"] == "resolved"
+    assert second.json()["result"] is None
+
+    # Same key via the header behaves identically.
+    third = client.post("/merges", json=payload, headers={"Idempotency-Key": "root-null-key"})
+    assert third.status_code == 200
+    assert third.json()["merge_id"] == first_body["merge_id"]
+
+
+def test_pending_merge_keeps_sql_null_and_still_returns_409(client):
+    # A conflicting merge stays pending: SQL NULL really means "no result
+    # yet", and both read endpoints must keep answering 409.
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 3}},
+    )
+    merge_id = resp.json()["merge_id"]
+    assert resp.json()["status"] == "pending"
+
+    from app import db
+
+    row = db.query_one("SELECT result FROM merges WHERE id = ?", (merge_id,))
+    assert row["result"] is None
+
+    assert client.get(f"/merges/{merge_id}/patch").status_code == 409
+    assert client.get(f"/merges/{merge_id}/evidence").status_code == 409
+
+
+def test_root_conflict_resolved_to_null_value_is_served(client):
+    # The conflict is at the document root itself; resolving it with an
+    # explicit null yields a resolved root-null result, same invariants.
+    resp = client.post("/merges", json={"base": {"a": 1}, "left": 5, "right": 6})
+    merge = resp.json()
+    assert merge["status"] == "pending"
+    merge_id = merge["merge_id"]
+
+    resolved = client.post(
+        f"/merges/{merge_id}/resolutions",
+        json={"revision": 1, "resolutions": [{"pointer": "", "value": None}]},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "resolved"
+    assert resolved.json()["result"] is None
+
+    patch = client.get(f"/merges/{merge_id}/patch").json()
+    assert patch["patch"] == [{"op": "replace", "path": "", "value": None}]
+
+    package = client.get(f"/merges/{merge_id}/evidence").json()
+    assert client.post("/evidence/verify", json=package).json()["valid"] is True
